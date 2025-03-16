@@ -47,7 +47,6 @@ class BaseBuffer(ABC):
         self.buffer_size = buffer_size
         self.observation_space = observation_space
         self.action_space = action_space
-        self.obs_shape = get_obs_shape(observation_space)
 
         self.action_dim = get_action_dim(action_space)
         self.pos = 0
@@ -131,6 +130,8 @@ class BaseBuffer(ABC):
             (may be useful to avoid changing things be reference)
         :return:
         """
+        if isinstance(array, dict):  # If the input is a dictionary
+            return {key: self.to_torch(value, copy) for key, value in array.items()}
         if copy:
             return th.tensor(array).to(self.device)
         return th.as_tensor(array).to(self.device)
@@ -345,6 +346,7 @@ class RolloutBuffer(BaseBuffer):
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
+        obs_mode: str = 'state',
     ):
 
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
@@ -353,11 +355,18 @@ class RolloutBuffer(BaseBuffer):
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
         self.generator_ready = False
+        self.obs_mode = obs_mode
         self.reset()
 
     def reset(self) -> None:
 
-        self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=np.float32)
+        self.observations = {}
+        if 'state' in self.obs_mode:
+            self.observations['state'] = np.zeros((self.buffer_size, self.n_envs) + self.observation_space['state'].shape, dtype=np.float32)
+        if 'image' in self.obs_mode:
+            self.observations['image'] = np.zeros((self.buffer_size, self.n_envs) + self.observation_space['image'].shape, dtype=np.uint8)
+        if 'extra' in self.obs_mode:
+            self.observations['extra'] = np.zeros((self.buffer_size, self.n_envs) + self.observation_space['extra'].shape, dtype=np.float32)
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -436,7 +445,8 @@ class RolloutBuffer(BaseBuffer):
         # Same reshape, for actions
         action = action.reshape((self.n_envs, self.action_dim))
 
-        self.observations[self.pos] = np.array(obs).copy()
+        for k, v in obs.items():
+            self.observations[k][self.pos] = np.array(v).copy()
         self.actions[self.pos] = np.array(action).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.episode_starts[self.pos] = np.array(episode_start).copy()
@@ -462,7 +472,11 @@ class RolloutBuffer(BaseBuffer):
             ]
 
             for tensor in _tensor_names:
-                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+                if isinstance(self.__dict__[tensor], dict):
+                    for key in self.__dict__[tensor].keys():
+                        self.__dict__[tensor][key] = self.swap_and_flatten(self.__dict__[tensor][key])
+                else:
+                    self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
             self.generator_ready = True
 
         # Return everything, don't create minibatches
@@ -476,7 +490,7 @@ class RolloutBuffer(BaseBuffer):
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> RolloutBufferSamples:
         data = (
-            self.observations[batch_inds],
+            {key: self.observations[key][batch_inds] for key in self.observations.keys()},
             self.actions[batch_inds],
             self.values[batch_inds].flatten(),
             self.log_probs[batch_inds].flatten(),

@@ -27,6 +27,7 @@ from stable_baselines3.common.torch_layers import (
     FlattenExtractor,
     MlpExtractor,
     NatureCNN,
+    DreamerCNN,
     create_mlp,
 )
 from stable_baselines3.common.type_aliases import Schedule
@@ -409,11 +410,13 @@ class ActorCriticPolicy(BasePolicy):
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor: str = 'DreamerCNN',
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        obs_mode: str = 'state',
+        encoder_cfg: dict = {}
     ):
 
         if optimizer_kwargs is None:
@@ -421,6 +424,10 @@ class ActorCriticPolicy(BasePolicy):
             # Small values to avoid NaN in Adam optimizer
             if optimizer_class == th.optim.Adam:
                 optimizer_kwargs["eps"] = 1e-5
+        
+        features_extractor_class = globals().get(features_extractor)
+        if not features_extractor_class:
+            raise ValueError(f"Feature extractor '{features_extractor}' not found.")
 
         super().__init__(
             observation_space,
@@ -434,7 +441,7 @@ class ActorCriticPolicy(BasePolicy):
 
         # Default network architecture, from stable-baselines
         if net_arch is None:
-            if features_extractor_class == NatureCNN:
+            if features_extractor_class in [NatureCNN, DreamerCNN]:
                 net_arch = []
             else:
                 net_arch = [dict(pi=[64, 64], vf=[64, 64])]
@@ -442,9 +449,18 @@ class ActorCriticPolicy(BasePolicy):
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
+        self.obs_mode = obs_mode
 
-        self.features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
-        self.features_dim = self.features_extractor.features_dim
+        obs_space = self.observation_space['image'] if 'image' in self.obs_mode else self.observation_space['state']
+        self.features_extractor = features_extractor_class(obs_space, **self.features_extractor_kwargs, config=encoder_cfg)
+        self.pi_features_dim = self.features_extractor.features_dim
+
+        if self.features_extractor.share_features:
+            self.vf_features_dim = self.pi_features_dim
+        elif 'state' in obs_mode and 'image' in obs_mode:
+            self.vf_features_dim = self.pi_features_dim + self.observation_space['state'].shape[0]
+        else:
+            self.vf_features_dim = self.pi_features_dim
 
         self.normalize_images = normalize_images
         self.log_std_init = log_std_init
@@ -508,7 +524,8 @@ class ActorCriticPolicy(BasePolicy):
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
         self.mlp_extractor = MlpExtractor(
-            self.features_dim,
+            self.pi_features_dim,
+            self.vf_features_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
@@ -568,7 +585,14 @@ class ActorCriticPolicy(BasePolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+
+        if self.features_extractor.share_features:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -624,7 +648,14 @@ class ActorCriticPolicy(BasePolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+
+        if self.features_extractor.share_features:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
@@ -639,7 +670,13 @@ class ActorCriticPolicy(BasePolicy):
         :return: the action distribution.
         """
         features = self.extract_features(obs)
-        latent_pi = self.mlp_extractor.forward_actor(features)
+
+        if self.features_extractor.share_features:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+
         return self._get_action_dist_from_latent(latent_pi)
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
@@ -842,7 +879,7 @@ class ContinuousCritic(BaseModel):
 
         action_dim = get_action_dim(self.action_space)
 
-        self.share_features_extractor = share_features_extractor
+        self.features_extractor.share_features = share_features_extractor
         self.n_critics = n_critics
         self.q_networks = []
         for idx in range(n_critics):
@@ -854,7 +891,7 @@ class ContinuousCritic(BaseModel):
     def forward(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
         # Learn the features extractor using the policy loss only
         # when the features_extractor is shared with the actor
-        with th.set_grad_enabled(not self.share_features_extractor):
+        with th.set_grad_enabled(not self.features_extractor.share_features):
             features = self.extract_features(obs)
         qvalue_input = th.cat([features, actions], dim=1)
         return tuple(q_net(qvalue_input) for q_net in self.q_networks)

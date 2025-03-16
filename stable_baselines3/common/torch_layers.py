@@ -2,9 +2,11 @@ from itertools import zip_longest
 from typing import Dict, List, Tuple, Type, Union
 
 import gym
+import os
 import torch as th
 from torch import nn
 
+from stable_baselines3.common.networks import MultiEncoder
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
@@ -23,10 +25,15 @@ class BaseFeaturesExtractor(nn.Module):
         assert features_dim > 0
         self._observation_space = observation_space
         self._features_dim = features_dim
+        self._share_features = True # whether pi and vf share same features
 
     @property
     def features_dim(self) -> int:
         return self._features_dim
+
+    @property
+    def share_features(self) -> bool:
+        return self._share_features
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
         raise NotImplementedError()
@@ -40,12 +47,12 @@ class FlattenExtractor(BaseFeaturesExtractor):
     :param observation_space:
     """
 
-    def __init__(self, observation_space: gym.Space):
+    def __init__(self, observation_space: gym.Space, config: dict = {}):
         super().__init__(observation_space, get_flattened_obs_dim(observation_space))
         self.flatten = nn.Flatten()
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        return self.flatten(observations)
+        return self.flatten(observations['state'])
 
 
 class NatureCNN(BaseFeaturesExtractor):
@@ -91,6 +98,54 @@ class NatureCNN(BaseFeaturesExtractor):
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.linear(self.cnn(observations))
+
+
+class DreamerCNN(BaseFeaturesExtractor):
+    """
+    CNN from DQN Nature paper:
+        Mnih, Volodymyr, et al.
+        "Human-level control through deep reinforcement learning."
+        Nature 518.7540 (2015): 529-533.
+
+    :param observation_space:
+    :param features_dim: Number of features extracted.
+        This corresponds to the number of unit for the last layer.
+    """
+
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512, config: dict = {}):
+        super().__init__(observation_space, features_dim)
+        # We assume CxHxW images (channels first)
+        # Re-ordering will be done by pre-preprocessing or wrapper
+        assert is_image_space(observation_space, check_channels=False)
+        self.cnn = MultiEncoder({'image': (64, 64, 3)}, **config)
+        
+        if config['pretrained']:
+            if os.path.exists(config['encoder_path']):
+                self.cnn.load_state_dict(th.load(config['encoder_path'], map_location='cuda:0')['encoder_state_dict'])
+                for param in self.cnn.parameters():
+                    param.requires_grad = False
+            else:
+                raise FileNotFoundError(f"{config['encoder_path']} path does not exist")
+
+        self.linear = nn.Sequential(nn.Linear(self.cnn.outdim, features_dim), nn.ReLU())
+        self._share_features = False
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        embed = self.linear(self.cnn(observations['image'].permute(0, 2, 3, 1)))
+
+        # Extra information (for actor and critic)
+        if 'extra' in observations:
+            latent_pi = th.cat((observations['extra'], embed), dim=1)
+        else:
+            latent_pi = embed
+
+        # State information (only for critic)
+        if 'state' in observations:
+            latent_vf = th.cat((latent_pi, observations['state']), dim=1)
+        else:
+            latent_vf = latent_pi
+
+        return latent_pi, latent_vf
 
 
 def create_mlp(
@@ -164,38 +219,32 @@ class MlpExtractor(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int,
+        pi_feature_dim: int,
+        vf_feature_dim: int,
         net_arch: List[Union[int, Dict[str, List[int]]]],
         activation_fn: Type[nn.Module],
         device: Union[th.device, str] = "auto",
     ):
         super().__init__()
         device = get_device(device)
-        shared_net, policy_net, value_net = [], [], []
+        policy_net, value_net = [], []
         policy_only_layers = []  # Layer sizes of the network that only belongs to the policy network
         value_only_layers = []  # Layer sizes of the network that only belongs to the value network
-        last_layer_dim_shared = feature_dim
 
         # Iterate through the shared layers and build the shared parts of the network
         for layer in net_arch:
-            if isinstance(layer, int):  # Check that this is a shared layer
-                # TODO: give layer a meaningful name
-                shared_net.append(nn.Linear(last_layer_dim_shared, layer))  # add linear of size layer
-                shared_net.append(activation_fn())
-                last_layer_dim_shared = layer
-            else:
-                assert isinstance(layer, dict), "Error: the net_arch list can only contain ints and dicts"
-                if "pi" in layer:
-                    assert isinstance(layer["pi"], list), "Error: net_arch[-1]['pi'] must contain a list of integers."
-                    policy_only_layers = layer["pi"]
+            assert isinstance(layer, dict), "Error: the net_arch list can only contain ints and dicts"
+            if "pi" in layer:
+                assert isinstance(layer["pi"], list), "Error: net_arch[-1]['pi'] must contain a list of integers."
+                policy_only_layers = layer["pi"]
 
-                if "vf" in layer:
-                    assert isinstance(layer["vf"], list), "Error: net_arch[-1]['vf'] must contain a list of integers."
-                    value_only_layers = layer["vf"]
-                break  # From here on the network splits up in policy and value network
+            if "vf" in layer:
+                assert isinstance(layer["vf"], list), "Error: net_arch[-1]['vf'] must contain a list of integers."
+                value_only_layers = layer["vf"]
+            break  # From here on the network splits up in policy and value network
 
-        last_layer_dim_pi = last_layer_dim_shared
-        last_layer_dim_vf = last_layer_dim_shared
+        last_layer_dim_pi = pi_feature_dim
+        last_layer_dim_vf = vf_feature_dim
 
         # Build the non-shared part of the network
         for pi_layer_size, vf_layer_size in zip_longest(policy_only_layers, value_only_layers):
@@ -217,7 +266,6 @@ class MlpExtractor(nn.Module):
 
         # Create networks
         # If the list of layers is empty, the network will just act as an Identity module
-        self.shared_net = nn.Sequential(*shared_net).to(device)
         self.policy_net = nn.Sequential(*policy_net).to(device)
         self.value_net = nn.Sequential(*value_net).to(device)
 
@@ -226,14 +274,13 @@ class MlpExtractor(nn.Module):
         :return: latent_policy, latent_value of the specified network.
             If all layers are shared, then ``latent_policy == latent_value``
         """
-        shared_latent = self.shared_net(features)
-        return self.policy_net(shared_latent), self.value_net(shared_latent)
+        return self.policy_net(features), self.value_net(features)
 
     def forward_actor(self, features: th.Tensor) -> th.Tensor:
-        return self.policy_net(self.shared_net(features))
+        return self.policy_net(features)
 
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
-        return self.value_net(self.shared_net(features))
+        return self.value_net(features)
 
 
 class CombinedExtractor(BaseFeaturesExtractor):
