@@ -47,6 +47,7 @@ class BaseBuffer(ABC):
         self.buffer_size = buffer_size
         self.observation_space = observation_space
         self.action_space = action_space
+        self.obs_shape = get_obs_shape(observation_space)
 
         self.action_dim = get_action_dim(action_space)
         self.pos = 0
@@ -706,7 +707,8 @@ class DictRolloutBuffer(RolloutBuffer):
         assert isinstance(self.obs_shape, dict), "DictRolloutBuffer must be used with Dict obs space only"
         self.observations = {}
         for key, obs_input_shape in self.obs_shape.items():
-            self.observations[key] = np.zeros((self.buffer_size, self.n_envs) + obs_input_shape, dtype=np.float32)
+            obs_input_dtype = np.uint8 if 'image' in key else np.float32
+            self.observations[key] = np.zeros((self.buffer_size, self.n_envs) + obs_input_shape, dtype=obs_input_dtype)
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
