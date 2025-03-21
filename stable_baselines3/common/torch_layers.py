@@ -128,6 +128,8 @@ class DreamerCNN(BaseFeaturesExtractor):
                 raise FileNotFoundError(f"{config['encoder_path']} path does not exist")
 
         self.linear = nn.Sequential(nn.Linear(self.cnn.outdim, features_dim), nn.ReLU())
+        self.linear_extra = nn.Sequential(nn.Linear(12, features_dim // 4), nn.ReLU())
+        self.linear_state = nn.Sequential(nn.Linear(24, features_dim // 4), nn.ReLU())
         self._share_features = False
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
@@ -135,13 +137,15 @@ class DreamerCNN(BaseFeaturesExtractor):
 
         # Extra information (for actor and critic)
         if 'extra' in observations:
-            latent_pi = th.cat((observations['extra'], embed), dim=1)
+            extra = self.linear_extra(observations['extra'])
+            latent_pi = th.cat((extra, embed), dim=1)
         else:
             latent_pi = embed
 
         # State information (only for critic)
         if 'state' in observations:
-            latent_vf = th.cat((latent_pi, observations['state']), dim=1)
+            state = self.linear_state(observations['state'])
+            latent_vf = th.cat((latent_pi, state), dim=1)
         else:
             latent_vf = latent_pi
 

@@ -453,12 +453,16 @@ class ActorCriticPolicy(BasePolicy):
 
         obs_space = self.observation_space['image'] if 'image' in self.obs_mode else self.observation_space['state']
         self.features_extractor = features_extractor_class(obs_space, **self.features_extractor_kwargs, config=encoder_cfg)
-        self.pi_features_dim = self.features_extractor.features_dim
+
+        if 'extra' in obs_mode:
+            self.pi_features_dim = self.features_extractor.features_dim + self.features_extractor.features_dim // 4
+        else:
+            self.pi_features_dim = self.features_extractor.features_dim
 
         if self.features_extractor.share_features:
             self.vf_features_dim = self.pi_features_dim
         elif 'state' in obs_mode and 'image' in obs_mode:
-            self.vf_features_dim = self.pi_features_dim + self.observation_space['state'].shape[0]
+            self.vf_features_dim = self.pi_features_dim + self.features_extractor.features_dim // 4
         else:
             self.vf_features_dim = self.pi_features_dim
 
