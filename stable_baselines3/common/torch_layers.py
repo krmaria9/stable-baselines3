@@ -117,7 +117,7 @@ class DreamerCNN(BaseFeaturesExtractor):
         # We assume CxHxW images (channels first)
         # Re-ordering will be done by pre-preprocessing or wrapper
         assert is_image_space(observation_space, check_channels=False)
-        self.cnn = MultiEncoder({'image': (64, 64, 3)}, **config)
+        self.cnn = MultiEncoder({'image': (observation_space.shape[1], observation_space.shape[2], observation_space.shape[0])}, **config)
         
         if config['pretrained']:
             if os.path.exists(config['encoder_path']):
