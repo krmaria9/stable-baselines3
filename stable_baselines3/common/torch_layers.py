@@ -124,6 +124,9 @@ class DreamerCNN(BaseFeaturesExtractor):
                 self.cnn.load_state_dict(th.load(config['encoder_path'], map_location='cuda:0')['encoder_state_dict'])
                 for param in self.cnn.parameters():
                     param.requires_grad = False
+                # Unfreeze the last layer of the cnn
+                for param in self.cnn._cnn.layers[-3:].parameters():
+                    param.requires_grad = True
             else:
                 raise FileNotFoundError(f"{config['encoder_path']} path does not exist")
 
