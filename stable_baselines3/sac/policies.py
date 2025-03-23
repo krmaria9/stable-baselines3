@@ -152,14 +152,7 @@ class Actor(BasePolicy):
             Mean, standard deviation and optional keyword arguments.
         """
         features = self.extract_features(obs)
-
-        if self.features_extractor.share_features:
-            pi_features = vf_features = features
-        else:
-            pi_features, vf_features = features
-
-        latent_pi = self.latent_pi(pi_features)
-
+        latent_pi = self.latent_pi(features)
         mean_actions = self.mu(latent_pi)
 
         if self.use_sde:
@@ -248,30 +241,32 @@ class SACPolicy(BasePolicy):
             squash_output=True,
         )
 
-        # Default network architecture, from stable-baselines
         if net_arch is None:
-            if features_extractor_class in [NatureCNN, DreamerCNN]:
-                net_arch = []
-            else:
-                net_arch = [256, 256]
+            net_arch = [256, 256]
 
         actor_arch, critic_arch = get_actor_critic_arch(net_arch)
 
         self.obs_mode = obs_mode
+        self.features_extractor_kwargs.update({
+            "config": encoder_cfg,
+        })
+        self.features_extractor_actor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
+        # Privileged critic
+        self.features_extractor_kwargs.update({
+            "privileged": True,
+        })
+        self.features_extractor_critic = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
+        self.features_extractor_target = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
 
-        obs_space = self.observation_space['image'] if 'image' in self.obs_mode else self.observation_space['state']
-        self.features_extractor = features_extractor_class(obs_space, **self.features_extractor_kwargs, config=encoder_cfg)
-        self.target_features_extractor = features_extractor_class(obs_space, **self.features_extractor_kwargs, config=encoder_cfg)
-
+        self.share_features_extractor = self.features_extractor_actor.share_features
+        
         if 'extra' in obs_mode:
-            self.pi_features_dim = self.features_extractor.features_dim + self.features_extractor.features_dim // 4
+            self.pi_features_dim = self.features_extractor_actor.features_dim + self.features_extractor_actor.features_dim // 4
         else:
-            self.pi_features_dim = self.features_extractor.features_dim
+            self.pi_features_dim = self.features_extractor_actor.features_dim
 
-        if self.features_extractor.share_features:
-            self.vf_features_dim = self.pi_features_dim
-        elif 'state' in obs_mode and 'image' in obs_mode:
-            self.vf_features_dim = self.pi_features_dim + self.features_extractor.features_dim // 4
+        if 'state' in obs_mode and 'image' in obs_mode:
+            self.vf_features_dim = self.pi_features_dim + self.features_extractor_actor.features_dim // 4
         else:
             self.vf_features_dim = self.pi_features_dim
 
@@ -299,29 +294,33 @@ class SACPolicy(BasePolicy):
             {
                 "n_critics": n_critics,
                 "net_arch": critic_arch,
-                "share_features_extractor": self.features_extractor.share_features,
                 "features_dim": self.vf_features_dim,
+                "share_features_extractor": self.share_features_extractor,
             }
         )
 
         self.actor, self.actor_target = None, None
         self.critic, self.critic_target = None, None
-        self.share_features_extractor = self.features_extractor.share_features
 
         self._build(lr_schedule)
 
     def _build(self, lr_schedule: Schedule) -> None:
-        self.actor = self.make_actor(features_extractor=self.features_extractor)
+        self.actor = self.make_actor(self.features_extractor_actor)
         self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
-        # We use the same feature extractor for actor and critic
-        self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
-        # Do not optimize the shared features extractor with the critic loss
-        # otherwise, there are gradient computation issues
-        critic_parameters = [param for name, param in self.critic.named_parameters() if "features_extractor" not in name]
+        if self.share_features_extractor:
+            self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
+            # Do not optimize the shared features extractor with the critic loss
+            # otherwise, there are gradient computation issues
+            critic_parameters = [param for name, param in self.critic.named_parameters() if "features_extractor" not in name]
+        else:
+            # Create a separate features extractor for the critic
+            # this requires more memory and computation
+            self.critic = self.make_critic(features_extractor=self.features_extractor_critic)
+            critic_parameters = self.critic.parameters()
 
         # Critic target should not share the features extractor with critic
-        self.critic_target = self.make_critic(features_extractor=self.target_features_extractor)
+        self.critic_target = self.make_critic(features_extractor=self.features_extractor_target)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.critic.optimizer = self.optimizer_class(critic_parameters, lr=lr_schedule(1), **self.optimizer_kwargs)

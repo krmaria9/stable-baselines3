@@ -883,7 +883,7 @@ class ContinuousCritic(BaseModel):
 
         action_dim = get_action_dim(self.action_space)
 
-        # self.features_extractor.share_features = share_features_extractor
+        self.share_features_extractor = share_features_extractor
         self.n_critics = n_critics
         self.q_networks = []
         for idx in range(n_critics):
@@ -895,19 +895,14 @@ class ContinuousCritic(BaseModel):
     def forward(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
         # Learn the features extractor using the policy loss only
         # when the features_extractor is shared with the actor
-
-        features = self.extract_features(obs)
-
-        if self.features_extractor.share_features:
-            pi_features = vf_features = features
-        else:
-            pi_features, vf_features = features
-
-        # Convert to double
-        vf_features = vf_features.to(th.float32)
+        with th.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs)
+            
+            
+        features = features.to(th.float32)
         actions = actions.to(th.float32)
 
-        qvalue_input = th.cat([vf_features, actions], dim=1)
+        qvalue_input = th.cat([features, actions], dim=1)
         return tuple(q_net(qvalue_input) for q_net in self.q_networks)
 
     def q1_forward(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:

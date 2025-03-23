@@ -25,7 +25,7 @@ class BaseFeaturesExtractor(nn.Module):
         assert features_dim > 0
         self._observation_space = observation_space
         self._features_dim = features_dim
-        self._share_features = True # whether pi and vf share same features
+        self._share_features = False # whether pi and vf share same features
 
     @property
     def features_dim(self) -> int:
@@ -47,7 +47,7 @@ class FlattenExtractor(BaseFeaturesExtractor):
     :param observation_space:
     """
 
-    def __init__(self, observation_space: gym.Space, config: dict = {}):
+    def __init__(self, observation_space: gym.Space, **kwargs):
         super().__init__(observation_space, get_flattened_obs_dim(observation_space))
         self.flatten = nn.Flatten()
 
@@ -112,12 +112,12 @@ class DreamerCNN(BaseFeaturesExtractor):
         This corresponds to the number of unit for the last layer.
     """
 
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512, config: dict = {}):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512, config: dict = {}, privileged: bool = False):
         super().__init__(observation_space, features_dim)
         # We assume CxHxW images (channels first)
         # Re-ordering will be done by pre-preprocessing or wrapper
-        assert is_image_space(observation_space, check_channels=False)
-        self.cnn = MultiEncoder({'image': (observation_space.shape[1], observation_space.shape[2], observation_space.shape[0])}, **config)
+        assert is_image_space(observation_space['image'], check_channels=False)
+        self.cnn = MultiEncoder({'image': (observation_space['image'].shape[1], observation_space['image'].shape[2], observation_space['image'].shape[0])}, **config)
         
         if config['pretrained']:
             if os.path.exists(config['encoder_path']):
@@ -130,29 +130,26 @@ class DreamerCNN(BaseFeaturesExtractor):
             else:
                 raise FileNotFoundError(f"{config['encoder_path']} path does not exist")
 
-        self.linear = nn.Sequential(nn.Linear(self.cnn.outdim, features_dim), nn.ReLU())
-        self.linear_extra = nn.Sequential(nn.Linear(12, features_dim // 4), nn.ReLU())
-        self.linear_state = nn.Sequential(nn.Linear(24, features_dim // 4), nn.ReLU())
-        self._share_features = False
+        self.linear = nn.Sequential(nn.Linear(self.cnn.outdim, features_dim), nn.LayerNorm(features_dim), nn.ReLU())
+        self.linear_extra = nn.Sequential(nn.Linear(12, features_dim // 4), nn.LayerNorm(features_dim // 4), nn.ReLU())
+        self.linear_state = nn.Sequential(nn.Linear(24, features_dim // 4), nn.LayerNorm(features_dim // 4), nn.ReLU())
+        self.privileged = privileged
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        embed = self.linear(self.cnn(observations['image'].permute(0, 2, 3, 1)))
+        latent = self.linear(self.cnn(observations['image'].permute(0, 2, 3, 1)))
 
         # Extra information (for actor and critic)
         if 'extra' in observations:
             extra = self.linear_extra(observations['extra'])
-            latent_pi = th.cat((extra, embed), dim=1)
-        else:
-            latent_pi = embed
+            latent = th.cat((latent, extra), dim=1)
 
         # State information (only for critic)
-        if 'state' in observations:
-            state = self.linear_state(observations['state'])
-            latent_vf = th.cat((latent_pi, state), dim=1)
-        else:
-            latent_vf = latent_pi
+        if self.privileged:
+            if 'state' in observations:
+                state = self.linear_state(observations['state'])
+                latent = th.cat((latent, state), dim=1)
 
-        return latent_pi, latent_vf
+        return latent
 
 
 def create_mlp(
